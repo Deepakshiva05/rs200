@@ -5,6 +5,7 @@ const FRAME_PREFIX = "/frames/ezgif-frame-";
 const FRAME_EXT = ".jpg";
 const FRAME_W = 1456;
 const FRAME_H = 816;
+const BATCH_SIZE = 10; // load 10 frames at a time — prevents browser throttling
 
 function pad(n) {
   return String(n).padStart(3, "0");
@@ -13,59 +14,100 @@ function pad(n) {
 export default function HeroSection() {
   const canvasRef = useRef(null);
   const framesRef = useRef([]);
-  const frameIndexRef = useRef(0);       // current frame (raw, float)
-  const animDoneRef = useRef(false);     // true once frame 299 reached
-  const lockedRef = useRef(true);        // blocks page scroll while animating
+  const frameIndexRef = useRef(0);
+  const animDoneRef = useRef(false);
 
   const [loadedCount, setLoadedCount] = useState(0);
   const [allLoaded, setAllLoaded] = useState(false);
   const [displayIndex, setDisplayIndex] = useState(0);
   const [heroVisible, setHeroVisible] = useState(true);
+  const [loadError, setLoadError] = useState(false);
 
-  // ── 1. Preload all frames ─────────────────────────────────────────────────
+  // ── Safety net: ALWAYS release body scroll on unmount ──────────────────
   useEffect(() => {
-    let loaded = 0;
-    const images = [];
-
-    for (let i = 1; i <= TOTAL_FRAMES; i++) {
-      const img = new Image();
-      img.src = `${FRAME_PREFIX}${pad(i)}${FRAME_EXT}`;
-      img.onload = img.onerror = () => {
-        loaded++;
-        setLoadedCount(loaded);
-        if (loaded === TOTAL_FRAMES) {
-          setAllLoaded(true);
-          const canvas = canvasRef.current;
-          if (canvas && images[0]?.complete) {
-            canvas.getContext("2d").drawImage(images[0], 0, 0, FRAME_W, FRAME_H);
-          }
-        }
-      };
-      images.push(img);
-    }
-    framesRef.current = images;
+    return () => {
+      document.body.style.overflow = "";
+    };
   }, []);
 
-  // ── 2. Draw a specific frame index ───────────────────────────────────────
+  // ── Batched frame preloader ─────────────────────────────────────────────
+  useEffect(() => {
+    const images = new Array(TOTAL_FRAMES).fill(null);
+    framesRef.current = images;
+    let loadedTotal = 0;
+    let errorTotal = 0;
+
+    const checkDone = () => {
+      if (loadedTotal + errorTotal === TOTAL_FRAMES) {
+        if (errorTotal > TOTAL_FRAMES * 0.5) {
+          // More than 50% failed — likely a path issue
+          setLoadError(true);
+          document.body.style.overflow = ""; // release scroll no matter what
+        } else {
+          setAllLoaded(true);
+          const canvas = canvasRef.current;
+          const first = framesRef.current[0];
+          if (canvas && first?.complete) {
+            canvas.getContext("2d").drawImage(first, 0, 0, FRAME_W, FRAME_H);
+          }
+        }
+      }
+    };
+
+    const loadBatch = (startIndex) => {
+      const end = Math.min(startIndex + BATCH_SIZE, TOTAL_FRAMES);
+      for (let i = startIndex; i < end; i++) {
+        const img = new Image();
+        // Use index starting at 1 (ezgif naming: 001..300)
+        img.src = `${FRAME_PREFIX}${pad(i + 1)}${FRAME_EXT}`;
+        img.onload = () => {
+          framesRef.current[i] = img;
+          loadedTotal++;
+          setLoadedCount(loadedTotal);
+          checkDone();
+        };
+        img.onerror = () => {
+          errorTotal++;
+          setLoadedCount(loadedTotal);
+          checkDone();
+        };
+        images[i] = img;
+      }
+      // Queue next batch after a small delay to prevent browser throttle
+      if (end < TOTAL_FRAMES) {
+        setTimeout(() => loadBatch(end), 50);
+      }
+    };
+
+    loadBatch(0);
+
+    // Fallback: if loading stalls for 30s, release scroll anyway
+    const fallbackTimer = setTimeout(() => {
+      document.body.style.overflow = "";
+      setAllLoaded(true); // attempt to proceed with whatever loaded
+    }, 30000);
+
+    return () => clearTimeout(fallbackTimer);
+  }, []);
+
+  // ── Draw a specific frame ───────────────────────────────────────────────
   const drawFrame = useCallback((index) => {
     const canvas = canvasRef.current;
     const img = framesRef.current[index];
-    if (!canvas || !img || !img.complete) return;
+    if (!canvas || !img || !img.complete || !img.naturalWidth) return;
     canvas.getContext("2d").drawImage(img, 0, 0, FRAME_W, FRAME_H);
   }, []);
 
-  // ── 3. Wire wheel + touch events to drive frames ─────────────────────────
+  // ── Wheel + touch → drive frame index ──────────────────────────────────
   useEffect(() => {
     if (!allLoaded) return;
 
-    // Sensitivity: how many frames per scroll tick
     const SPEED = 1.5;
     let touchStartY = 0;
 
     const advance = (delta) => {
-      if (animDoneRef.current) return; // animation finished — let page scroll freely
+      if (animDoneRef.current) return;
 
-      // delta > 0 = scroll down = advance frames
       frameIndexRef.current = Math.min(
         TOTAL_FRAMES - 1,
         Math.max(0, frameIndexRef.current + delta * SPEED)
@@ -78,20 +120,20 @@ export default function HeroSection() {
 
       if (idx >= TOTAL_FRAMES - 1) {
         animDoneRef.current = true;
-        lockedRef.current = false;
-        document.body.style.overflow = ""; // release scroll
+        document.body.style.overflow = "";
       }
     };
 
-    // Wheel handler — preventDefault blocks page scroll while locked
     const onWheel = (e) => {
       if (animDoneRef.current) return;
       e.preventDefault();
       advance(e.deltaY > 0 ? 1 : -1);
     };
 
-    // Touch handlers
-    const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; };
+    const onTouchStart = (e) => {
+      touchStartY = e.touches[0].clientY;
+    };
+
     const onTouchMove = (e) => {
       if (animDoneRef.current) return;
       e.preventDefault();
@@ -100,9 +142,9 @@ export default function HeroSection() {
       advance(dy > 0 ? 1 : -1);
     };
 
-    // Lock body scroll at start
+    // Lock scroll and attach listeners
     document.body.style.overflow = "hidden";
-    lockedRef.current = true;
+    animDoneRef.current = false;
 
     window.addEventListener("wheel", onWheel, { passive: false });
     window.addEventListener("touchstart", onTouchStart, { passive: true });
@@ -112,7 +154,7 @@ export default function HeroSection() {
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("touchstart", onTouchStart);
       window.removeEventListener("touchmove", onTouchMove);
-      document.body.style.overflow = ""; // always clean up
+      document.body.style.overflow = "";
     };
   }, [allLoaded, drawFrame]);
 
@@ -120,7 +162,6 @@ export default function HeroSection() {
   const loadPct = Math.round((loadedCount / TOTAL_FRAMES) * 100);
 
   return (
-    // 100vh only — no scroll-zone height needed anymore
     <section id="hero" style={{ height: "100vh", position: "relative" }}>
       <div style={styles.sticky}>
         <div style={styles.canvasOuter}>
@@ -131,11 +172,10 @@ export default function HeroSection() {
             style={styles.canvas}
           />
 
-          {/* Vignette */}
           <div style={styles.vignette} />
 
           {/* Loading overlay */}
-          {!allLoaded && (
+          {!allLoaded && !loadError && (
             <div style={styles.loadOverlay}>
               <p style={styles.loadEyebrow}>BAJAJ RS200</p>
               <p style={styles.loadTitle}>LOADING</p>
@@ -143,6 +183,18 @@ export default function HeroSection() {
                 <div style={{ ...styles.loadBarFill, width: `${loadPct}%` }} />
               </div>
               <p style={styles.loadCount}>{loadedCount} / {TOTAL_FRAMES} frames</p>
+            </div>
+          )}
+
+          {/* Error state */}
+          {loadError && (
+            <div style={styles.loadOverlay}>
+              <p style={styles.loadEyebrow}>⚠ ERROR</p>
+              <p style={{ ...styles.loadTitle, fontSize: "32px" }}>Frames not found</p>
+              <p style={styles.loadCount}>
+                Make sure your frames are in <code style={{ color: "#FFD700" }}>/public/frames/</code>
+                <br />named <code style={{ color: "#FFD700" }}>ezgif-frame-001.jpg</code> → <code style={{ color: "#FFD700" }}>ezgif-frame-300.jpg</code>
+              </p>
             </div>
           )}
 
@@ -171,7 +223,11 @@ export default function HeroSection() {
                 <div style={{ ...styles.progressFill, width: `${pct}%` }} />
               </div>
               <span style={styles.progressLabel}>
-                {pct < 5 ? "Side Profile" : pct < 95 ? "Exploding..." : "Full Detail — scroll to continue"}
+                {pct < 5
+                  ? "Side Profile"
+                  : pct < 95
+                  ? "Exploding..."
+                  : "Full Detail — scroll to continue ↓"}
               </span>
             </div>
           )}
@@ -251,6 +307,8 @@ const styles = {
     fontSize: "12px",
     color: "rgba(255,255,255,0.3)",
     letterSpacing: "0.05em",
+    textAlign: "center",
+    lineHeight: 1.8,
   },
   heroText: {
     position: "absolute",
@@ -309,7 +367,7 @@ const styles = {
     flexDirection: "column",
     alignItems: "center",
     gap: "6px",
-    width: "260px",
+    width: "280px",
   },
   progressTrack: {
     width: "100%",
@@ -331,5 +389,3 @@ const styles = {
     textTransform: "uppercase",
   },
 };
-
-
